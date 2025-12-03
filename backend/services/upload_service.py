@@ -58,7 +58,7 @@ class UploadService:
         self.milvus = milvus_client
         self.es = es_service
         self.embedder = embedding_service
-        # Dedicated thread pool for uploads (separate from system pool)
+        # Thread pool for CPU-bound tasks (Pandas, Embeddings, Milvus Insert)
         self._executor = ThreadPoolExecutor(
             max_workers=2, 
             thread_name_prefix="upload_worker"
@@ -75,7 +75,7 @@ class UploadService:
             return 0
 
     async def process_csv_background(self, job_id: str, file_path: str) -> None:
-        logger.info(f"Job {job_id}: Processing {file_path}")
+        logger.info(f"Start processing job: {job_id} | File: {file_path}")
         start_time = datetime.now()
         
         chunk_size = settings.upload.pandas_chunk_size
@@ -110,20 +110,17 @@ class UploadService:
             ) as reader:
                 
                 for chunk_num, df in enumerate(reader, start=1):
-                    # CRITICAL: Yield control to event loop frequently
-                    # This allows search requests to be processed
-                    await asyncio.sleep(0.2)
+                    # Yield control to allow status endpoint to respond
+                    await asyncio.sleep(0.1)
 
                     if df.empty:
                         continue
                     
                     current_percent = int(((chunk_num - 1) / total_chunks) * 100)
+                    msg = f"Processing chunk {chunk_num}/{total_chunks} ({current_percent}%)"
                     
-                    UPLOAD_JOBS.update(
-                        job_id, 
-                        progress=current_percent, 
-                        message=f"Processing chunk {chunk_num}/{total_chunks} ({current_percent}%)"
-                    )
+                    UPLOAD_JOBS.update(job_id, progress=current_percent, message=msg)
+                    logger.info(f"Job {job_id}: {msg}")
 
                     chunk_success, chunk_failed = await self._process_single_chunk(
                         df, 
@@ -149,10 +146,10 @@ class UploadService:
                     "time_ms": duration_ms
                 }
             )
-            logger.info(f"Job {job_id} finished.")
+            logger.info(f"Job {job_id} Finished. Success: {success_count}, Failed: {failed_count}")
 
         except Exception as e:
-            logger.error(f"Job {job_id} crashed: {e}")
+            logger.error(f"Job {job_id} CRASHED: {e}")
             UPLOAD_JOBS.fail(job_id, str(e))
         finally:
             if os.path.exists(file_path):
@@ -177,7 +174,7 @@ class UploadService:
             
             df.columns = [c.lower().strip() for c in df.columns]
 
-            # 1. Parsing (Fast, no blocking)
+            # 1. Parsing
             for idx, row in df.iterrows():
                 try:
                     title = str(row.get("title", "")).strip()
@@ -191,6 +188,7 @@ class UploadService:
 
                     doc_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{url}-{title}"))
                     
+                    # Date Handling
                     try:
                         raw_date = row.get("published_at")
                         if raw_date and str(raw_date).strip():
@@ -226,41 +224,49 @@ class UploadService:
             if not es_docs:
                 return 0, failed_rows
 
-            # 2. Embedding (Now queued with lower priority)
-            UPLOAD_JOBS.update(job_id, percent, f"Embedding chunk {chunk_num}/{total_chunks} ({percent}%)")
+            logger.info(f"Job {job_id}: Chunk {chunk_num} parsed. {len(es_docs)} valid rows.")
+
+            # 2. Embedding (CPU Bound -> Executor)
+            UPLOAD_JOBS.update(job_id, percent, f"Embedding chunk {chunk_num}/{total_chunks}...")
             
             loop = asyncio.get_running_loop()
-            # Run in executor but the actual embedding is queued in worker thread
+            
             vectors: List[List[float]] = await loop.run_in_executor(
                 self._executor, 
                 self.embedder.embed_documents, 
                 texts_to_embed
             )
             milvus_data_buffer["embeddings"] = vectors
+            
+            logger.info(f"Job {job_id}: Chunk {chunk_num} embedded. Vectors: {len(vectors)}")
 
-            # 3. Indexing (Non-blocking operations)
-            UPLOAD_JOBS.update(job_id, percent, f"Indexing chunk {chunk_num}/{total_chunks} ({percent}%)")
+            # 3. Indexing (Milvus + ES)
+            UPLOAD_JOBS.update(job_id, percent, f"Indexing chunk {chunk_num}/{total_chunks}...")
 
-            # Both operations are now non-blocking
-            await asyncio.gather(
-                loop.run_in_executor(
-                    self._executor,
-                    self.milvus.insert_vectors,
-                    milvus_data_buffer["ids"], 
-                    milvus_data_buffer["embeddings"], 
-                    milvus_data_buffer["timestamps"]
-                ),
-                self.es.bulk_index(es_docs)
+            # Run Milvus insert in executor because it now calls FLUSH (Blocking)
+            milvus_task = loop.run_in_executor(
+                self._executor,
+                self.milvus.insert_vectors,
+                milvus_data_buffer["ids"], 
+                milvus_data_buffer["embeddings"], 
+                milvus_data_buffer["timestamps"]
             )
+            
+            # Run ES bulk in async (It's IO bound mostly)
+            es_task = self.es.bulk_index(es_docs)
+
+            # Wait for both
+            await asyncio.gather(milvus_task, es_task)
+            
+            logger.info(f"Job {job_id}: Chunk {chunk_num} DONE. Updates should be visible.")
             
             return len(es_docs), failed_rows
 
         except Exception as e:
-            logger.error(f"Chunk error: {e}")
+            logger.error(f"Job {job_id}: Chunk {chunk_num} FAILED Error: {e}")
             return 0, len(df)
 
     async def cleanup(self) -> None:
-        """Cleanup resources"""
         self._executor.shutdown(wait=False)
 
 def get_upload_service(

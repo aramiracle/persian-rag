@@ -21,7 +21,6 @@ class ElasticsearchService:
         try:
             exists = await self.client.indices.exists(index=self.index_name)
             
-            # Persian-optimized configuration
             index_config = {
                 "settings": {
                     "number_of_shards": 1, 
@@ -62,7 +61,7 @@ class ElasticsearchService:
             if exists:
                 logger.info(f"Index '{self.index_name}' exists.")
             else:
-                logger.info(f"Creating Elasticsearch index: {self.index_name} (Persian Analyzer)")
+                logger.info(f"Creating Elasticsearch index: {self.index_name}")
                 await self.client.indices.create(index=self.index_name, body=index_config)
                 
             self._initialized = True
@@ -76,7 +75,11 @@ class ElasticsearchService:
     async def bulk_index(self, documents: List[Dict[str, Any]]) -> Tuple[int, int]:
         actions = [{ "_index": self.index_name, "_id": doc["doc_id"], "_source": doc } for doc in documents]
         try:
+            # refresh=True ensures the documents are immediately searchable and visible to count API
             success, failed = await helpers.async_bulk(self.client, actions, refresh=True)
+            
+            logger.info(f"ES: Indexed {success} documents (Failed: {len(failed) if isinstance(failed, list) else 0})")
+            
             return success, len(failed) if isinstance(failed, list) else 0
         except Exception as e:
             logger.error(f"ES bulk index error: {e}")
@@ -85,7 +88,6 @@ class ElasticsearchService:
     async def search(self, query: str, top_k: int = 10) -> List[Tuple[str, float]]:
         if not query or not query.strip(): return []
         
-        # Uses multi_match with phrase_prefix for better Persian performance
         search_body = {
             "size": top_k,
             "_source": False,
@@ -98,10 +100,7 @@ class ElasticsearchService:
             }
         }
         try:
-            resp = await self.client.search(
-                index=self.index_name, 
-                body=search_body
-            )
+            resp = await self.client.search(index=self.index_name, body=search_body)
             hits = resp['hits']['hits']
             return [(hit['_id'], hit['_score']) for hit in hits]
         except Exception as e:
@@ -117,13 +116,7 @@ class ElasticsearchService:
             "query": {
                 "bool": {
                     "must": [
-                        {
-                            "multi_match": {
-                                "query": query,
-                                "fields": ["title", "content"],
-                                "type": "phrase_prefix"
-                            }
-                        }
+                        {"multi_match": {"query": query, "fields": ["title", "content"], "type": "phrase_prefix"}}
                     ],
                     "filter": [
                         {"ids": {"values": doc_ids}}
@@ -131,12 +124,8 @@ class ElasticsearchService:
                 }
             }
         }
-        
         try:
-            resp = await self.client.search(
-                index=self.index_name, 
-                body=search_body
-            )
+            resp = await self.client.search(index=self.index_name, body=search_body)
             return {hit['_id']: hit['_score'] for hit in resp['hits']['hits']}
         except Exception as e:
             logger.error(f"ES Cross-Score failed: {e}")

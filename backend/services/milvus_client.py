@@ -20,7 +20,6 @@ class MilvusClient:
         self.dimension = settings.milvus.dimension
         self.alias = "default"
         self._collection: Optional[Collection] = None
-        # Lock only for connection/disconnection/index_building
         self._mgmt_lock = threading.RLock()
         self._index_built = False
         self.output_fields = ["doc_id"] 
@@ -48,7 +47,7 @@ class MilvusClient:
                     
                     try:
                         self._collection.load()
-                        logger.info(f"Collection '{self.collection_name}' loaded.")
+                        logger.info(f"Collection '{self.collection_name}' loaded. Entities: {self._collection.num_entities}")
                     except MilvusException as e:
                         if "index not found" in str(e) or e.code == 700:
                             logger.info("Index not found. Attempting to build...")
@@ -87,7 +86,6 @@ class MilvusClient:
         """
         Thread-safe index building.
         """
-        # Double check locking here to ensure only one thread builds the index
         with self._mgmt_lock:
             if not self._collection:
                 return
@@ -125,6 +123,8 @@ class MilvusClient:
                 try:
                     self._collection.create_index(field_name="doc_id", index_name="doc_id_index")
                 except: pass
+                
+                logger.info("Milvus Index built successfully.")
                     
             except Exception as e:
                 logger.error(f"Index build failed: {e}")
@@ -133,37 +133,42 @@ class MilvusClient:
         if not self._collection:
             raise RuntimeError("Milvus disconnected")
         
-        data = [doc_ids, embeddings, timestamps]
-        
-        # NO LOCK HERE - Allow concurrent searches while inserting
-        res = self._collection.insert(data)
-        
-        # Check if we need to build index (using lock internally)
-        if not self._index_built:
-            # Only acquire lock if we suspect we need to build
-            if self._collection.num_entities >= settings.milvus.index_build_threshold:
-                self._build_index_safe()
-                # Try to load if we just built it
-                with self._mgmt_lock:
-                    if self._index_built:
-                        try:
-                            self._collection.load()
-                        except: pass
+        try:
+            data = [doc_ids, embeddings, timestamps]
+            
+            # 1. Insert (In-Memory)
+            res = self._collection.insert(data)
+            
+            # 2. FORCE FLUSH: This forces Milvus to seal the segment and update 'num_entities'.
+            #    This is blocking, but essential for the UI to see the count update in real-time.
+            #    Since this runs in a ThreadExecutor (from upload_service), it won't block the API.
+            self._collection.flush()
+            
+            logger.info(f"Milvus: Inserted {len(doc_ids)} vectors. Total Entities: {self._collection.num_entities}")
 
-        return list(res.primary_keys)
+            # 3. Check Index
+            if not self._index_built:
+                if self._collection.num_entities >= settings.milvus.index_build_threshold:
+                    self._build_index_safe()
+                    with self._mgmt_lock:
+                        if self._index_built:
+                            try:
+                                self._collection.load()
+                            except: pass
+
+            return list(res.primary_keys)
+        except Exception as e:
+            logger.error(f"Milvus insert failed: {e}")
+            raise e
 
     def search(self, query_embedding: List[float], top_k: int = 10) -> List[Dict[str, Any]]:
         if not self._collection: 
             raise RuntimeError("Milvus disconnected")
         
-        # NO LOCK HERE - Search should run freely
         if self._collection.num_entities == 0:
             return []
         
         try:
-            # Pymilvus handles load check internally usually, but we can double check light-weight
-            # or just let it fail if not loaded.
-            
             search_params = {
                 "metric_type": settings.milvus.metric_type, 
                 "params": {"nprobe": settings.milvus.nprobe}
@@ -178,11 +183,10 @@ class MilvusClient:
                 index_name="vector_index"
             )
         except MilvusException as e:
-            # If collection not loaded, try to load it safely
+            # Reload if needed
             if "not loaded" in str(e).lower() or e.code == 700:
                 with self._mgmt_lock:
                     self._collection.load()
-                # Retry once
                 return self.search(query_embedding, top_k)
             logger.error(f"Search error: {e}")
             raise
@@ -200,7 +204,6 @@ class MilvusClient:
         if not self._collection or not doc_ids:
             return {}
 
-        # NO LOCK HERE
         ids_expr = str(doc_ids)
         try:
             res = self._collection.query(
@@ -215,7 +218,10 @@ class MilvusClient:
     def health_check(self) -> Dict[str, Any]:
         if not self._collection:
             return {"status": "disconnected"}
-        return {"status": "up", "approx_count": self._collection.num_entities}
+        
+        # This count will only be accurate if flush() was called recently
+        count = self._collection.num_entities
+        return {"status": "up", "approx_count": count}
 
 _milvus_client: Optional[MilvusClient] = None
 _init_lock = threading.Lock()

@@ -2,26 +2,28 @@ import os
 import time
 import threading
 from typing import List, Optional
-from queue import Queue, Empty
-from dataclasses import dataclass
+from collections import deque
 
 import numpy as np
 from loguru import logger
-from tenacity import retry, stop_after_attempt, wait_exponential
 
 from backend.core.config import settings
 
 LLAMA_POOLING_TYPE_MEAN = 1
 
-
-@dataclass
 class EmbeddingRequest:
-    """Request wrapper for priority queue"""
-    texts: List[str]
-    is_query: bool  # True for search queries (high priority)
-    result_queue: Queue
-    request_id: str
-
+    """
+    Lightweight holder for request data and synchronization primitives.
+    Avoids overhead of complex objects.
+    """
+    __slots__ = ('texts', 'event', 'result', 'error', 'created_at')
+    
+    def __init__(self, texts: List[str]):
+        self.texts = texts
+        self.event = threading.Event()
+        self.result = None
+        self.error = None
+        self.created_at = time.time()
 
 class EmbeddingService:
     def __init__(self) -> None:
@@ -31,18 +33,21 @@ class EmbeddingService:
         self.dimension = settings.embedding.dimension
         self.doc_prefix = getattr(settings.embedding, 'document_prefix', "passage: ")
         self.query_prefix = getattr(settings.embedding, 'query_prefix', "query: ")
+        
         self._model = None
         self._initialized = False
         
-        # Separate queues for queries and documents
-        self._query_queue: Queue = Queue()
-        self._doc_queue: Queue = Queue()
+        # --- Custom Priority Queue using Deque ---
+        # High Priority: Search Queries
+        self._high_prio_queue: deque = deque()
+        # Low Priority: Document Upload Chunks
+        self._low_prio_queue: deque = deque()
         
-        # Worker thread
+        # Synchronization
+        self._cv = threading.Condition()
         self._worker_thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
+        self._stop_event = False
         
-        # Lock only for initialization
         self._init_lock = threading.Lock()
 
     def initialize(self) -> None:
@@ -53,149 +58,156 @@ class EmbeddingService:
                 raise FileNotFoundError(f"Model not found: {self.model_path}")
 
             from llama_cpp import Llama
-            logger.info(f"Loading embedding model: {self.model_path}")
+            logger.info(f"Loading embedding model: {self.model_path} (Device: {self.device})")
 
             self._model = Llama(
                 model_path=self.model_path,
                 embedding=True,
                 pooling_type=LLAMA_POOLING_TYPE_MEAN,
                 n_gpu_layers=-1 if self.device == "cuda" else 0,
-                n_ctx=32768,
+                n_ctx=8192,
                 n_batch=self.batch_size,
                 verbose=False,
             )
             self._initialized = True
-            logger.info(f"Embedding model ready (dim={self.dimension})")
+            logger.info(f"Embedding model ready. Batch Size: {self.batch_size}")
             
-            # Start worker thread
             self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
             self._worker_thread.start()
-            logger.info("Embedding worker thread started")
 
     def _worker_loop(self) -> None:
         """
-        Worker thread that processes embedding requests.
-        Prioritizes query requests over document batches.
+        Worker loop using Condition Variables for low-latency wakeups.
+        Checks High Priority queue strictly before Low Priority.
         """
-        logger.info("Embedding worker loop started")
+        logger.info("Embedding worker loop started (Deque Mode)")
         
-        while not self._stop_event.is_set():
-            try:
-                # Check query queue first (high priority)
-                try:
-                    req = self._query_queue.get(timeout=0.01)
-                    self._process_request(req)
-                    continue
-                except Empty:
-                    pass
+        while True:
+            req: Optional[EmbeddingRequest] = None
+            
+            # 1. Acquire Lock & Wait for Work
+            with self._cv:
+                while (not self._high_prio_queue and not self._low_prio_queue) and not self._stop_event:
+                    self._cv.wait() # Releases lock and sleeps until notified
                 
-                # Then check document queue (lower priority)
-                try:
-                    req = self._doc_queue.get(timeout=0.1)
-                    self._process_request(req)
-                except Empty:
-                    continue
-                    
-            except Exception as e:
-                logger.error(f"Worker loop error: {e}")
-                time.sleep(0.1)
-        
-        logger.info("Embedding worker loop stopped")
+                if self._stop_event:
+                    break
 
-    def _process_request(self, req: EmbeddingRequest) -> None:
-        """Process a single embedding request"""
+                # 2. Strict Priority Selection
+                if self._high_prio_queue:
+                    req = self._high_prio_queue.popleft()
+                elif self._low_prio_queue:
+                    req = self._low_prio_queue.popleft()
+            
+            # 3. Process (Outside Lock)
+            if req:
+                self._process_request_safe(req)
+
+    def _process_request_safe(self, req: EmbeddingRequest) -> None:
         try:
-            embeddings = self._compute_embeddings(req.texts)
-            req.result_queue.put(("success", embeddings))
+            # Drop stale requests (> 5 mins old)
+            if time.time() - req.created_at > 300:
+                logger.warning("Dropping stale embedding request")
+                return
+
+            embeddings = self._compute_batch(req.texts)
+            req.result = embeddings
         except Exception as e:
-            logger.error(f"Embedding computation failed: {e}")
-            req.result_queue.put(("error", str(e)))
+            logger.error(f"Embedding failed: {e}")
+            req.error = e
+        finally:
+            # Wake up the waiter
+            req.event.set()
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), reraise=True)
-    def _compute_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """
-        Core embedding computation without locks.
-        Only called by worker thread, so no race conditions.
-        """
-        if not self._initialized:
+    def _compute_batch(self, texts: List[str]) -> List[List[float]]:
+        if not self._initialized or not self._model:
             raise RuntimeError("Model not initialized")
-        if not texts:
-            return []
-
-        embeddings = []
         
-        # Process in mini-batches
+        embeddings = []
+        # Process in model's native batch size
         for i in range(0, len(texts), self.batch_size):
             batch = texts[i:i + self.batch_size]
             
-            # No lock needed - only worker thread calls this
+            # llama.cpp is not thread-safe, but only this worker calls it
             result = self._model.create_embedding(batch)
+            
             vectors = np.array([item["embedding"] for item in result["data"]], dtype=np.float32)
 
             if self.dimension < vectors.shape[1]:
                 vectors = vectors[:, :self.dimension]
-
+            
             norms = np.linalg.norm(vectors, axis=1, keepdims=True)
             norms[norms == 0] = 1
+            
             embeddings.extend((vectors / norms).tolist())
 
         return embeddings
 
-    def _submit_request(self, texts: List[str], is_query: bool, timeout: float = 30.0) -> List[List[float]]:
-        """Submit request to appropriate queue and wait for result"""
-        if not self._initialized:
-            raise RuntimeError("Model not initialized")
+    def embed_query(self, text: str) -> List[float]:
+        """
+        High Priority: Adds to _high_prio_queue
+        """
+        if not text: return [0.0] * self.dimension
         
-        result_queue = Queue()
-        req = EmbeddingRequest(
-            texts=texts,
-            is_query=is_query,
-            result_queue=result_queue,
-            request_id=f"{time.time()}"
-        )
+        processed = f"{self.query_prefix}{' '.join(text.split())}"
+        req = EmbeddingRequest([processed])
         
-        # Route to appropriate queue
-        if is_query:
-            self._query_queue.put(req)
+        with self._cv:
+            self._high_prio_queue.append(req)
+            self._cv.notify() # Wake up worker immediately
+        
+        # Fast timeout for queries
+        if req.event.wait(timeout=20.0):
+            if req.error: raise req.error
+            return req.result[0]
         else:
-            self._doc_queue.put(req)
-        
-        # Wait for result
-        try:
-            status, result = result_queue.get(timeout=timeout)
-            if status == "error":
-                raise RuntimeError(f"Embedding failed: {result}")
-            return result
-        except Empty:
-            raise TimeoutError(f"Embedding request timed out after {timeout}s")
+            raise TimeoutError("Embedding query timed out (System busy)")
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         """
-        Used by Upload Service (Bulk) - Lower priority
+        Low Priority: Slices into micro-batches and adds to _low_prio_queue.
+        Allows High Priority queries to jump the queue between batches.
         """
-        if not texts:
-            return []
-        processed = [f"{self.doc_prefix}{' '.join(t.split())}" for t in texts]
-        return self._submit_request(processed, is_query=False, timeout=60.0)
-
-    def embed_query(self, text: str) -> List[float]:
-        """
-        Used by Search/RAG (Single) - High priority
-        """
-        if not text or not text.strip():
-            return [0.0] * self.dimension
-        processed = f"{self.query_prefix}{' '.join(text.split())}"
+        if not texts: return []
         
-        # Queries get priority and fast processing
-        embeddings = self._submit_request([processed], is_query=True, timeout=10.0)
-        return embeddings[0] if embeddings else [0.0] * self.dimension
+        processed_texts = [f"{self.doc_prefix}{' '.join(t.split())}" for t in texts]
+        
+        # Create requests for micro-batches
+        micro_batches = []
+        for i in range(0, len(processed_texts), self.batch_size):
+            batch = processed_texts[i : i + self.batch_size]
+            micro_batches.append(EmbeddingRequest(batch))
+        
+        # Enqueue all batches
+        with self._cv:
+            for req in micro_batches:
+                self._low_prio_queue.append(req)
+            self._cv.notify(n=len(micro_batches))
+            
+        # Wait for results sequentially
+        # This blocks the Upload Worker, but not the Embedding Worker
+        results = []
+        try:
+            for req in micro_batches:
+                # Long timeout for bulk processing
+                if req.event.wait(timeout=600.0):
+                    if req.error: raise req.error
+                    results.extend(req.result)
+                else:
+                    raise TimeoutError("Bulk embedding timed out")
+            return results
+        except Exception as e:
+            logger.error(f"Bulk embed error: {e}")
+            raise e
 
     def cleanup(self) -> None:
         with self._init_lock:
-            # Stop worker thread
-            if self._worker_thread and self._worker_thread.is_alive():
-                self._stop_event.set()
-                self._worker_thread.join(timeout=5.0)
+            with self._cv:
+                self._stop_event = True
+                self._cv.notify_all()
+            
+            if self._worker_thread:
+                self._worker_thread.join(timeout=2.0)
             
             if self._model:
                 del self._model
@@ -203,21 +215,11 @@ class EmbeddingService:
             self._initialized = False
 
     def health_check(self) -> dict:
-        if not self._initialized:
-            return {"status": "down", "error": "Not initialized"}
-        try:
-            # Quick health check
-            test_emb = self.embed_query("test")
-            return {
-                "status": "up", 
-                "dimension": self.dimension,
-                "worker_alive": self._worker_thread.is_alive() if self._worker_thread else False,
-                "query_queue_size": self._query_queue.qsize(),
-                "doc_queue_size": self._doc_queue.qsize()
-            }
-        except Exception as e:
-            return {"status": "down", "error": str(e)}
-
+        return {
+            "status": "up" if self._initialized else "down",
+            "high_prio_pending": len(self._high_prio_queue),
+            "low_prio_pending": len(self._low_prio_queue)
+        }
 
 _service: Optional[EmbeddingService] = None
 _global_init_lock = threading.Lock()
