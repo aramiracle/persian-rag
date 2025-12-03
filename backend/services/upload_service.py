@@ -87,6 +87,7 @@ class UploadService:
         chunk_size = settings.upload.pandas_chunk_size
         total_processed = 0
         success_count = 0
+        failed_count = 0
         
         try:
             # --- STEP 1: Exact Row Count (Parser Aware) ---
@@ -135,7 +136,7 @@ class UploadService:
                     )
 
                     # Process the chunk
-                    chunk_success = await self._process_single_chunk(
+                    chunk_success, chunk_failed = await self._process_single_chunk(
                         df, 
                         job_id=job_id, 
                         chunk_num=chunk_num, 
@@ -143,6 +144,7 @@ class UploadService:
                     )
                     
                     success_count += chunk_success
+                    failed_count += chunk_failed
                     total_processed += len(df)
                     
             # --- STEP 3: Completion ---
@@ -154,11 +156,11 @@ class UploadService:
                 result={
                     "total_processed": total_processed, 
                     "success": success_count, 
-                    "failed": total_processed - success_count, 
+                    "failed": failed_count, 
                     "time_ms": duration_ms
                 }
             )
-            logger.info(f"Job {job_id} finished. Total rows: {total_processed}")
+            logger.info(f"Job {job_id} finished. Total: {total_processed}, Success: {success_count}, Failed: {failed_count}")
 
         except Exception as e:
             logger.error(f"Job {job_id} crashed: {e}")
@@ -174,9 +176,10 @@ class UploadService:
         job_id: str, 
         chunk_num: int, 
         total_chunks: int
-    ) -> int:
+    ) -> tuple[int, int]:
         """
         Processes a single dataframe chunk with granular status updates.
+        Returns: (success_count, failed_count)
         """
         try:
             # Recalculate percent for sub-steps
@@ -186,43 +189,77 @@ class UploadService:
             es_docs: List[Dict[str, Any]] = []
             milvus_data_buffer: Dict[str, List[Any]] = {"ids": [], "embeddings": [], "timestamps": []}
             texts_to_embed: List[str] = []
+            failed_rows = 0
             
             df.columns = [c.lower().strip() for c in df.columns]
 
             # 1. Parsing
-            for _, row in df.iterrows():
-                title = str(row.get("title", "")).strip()
-                url = str(row.get("url", "")).strip()
-                content = str(row.get("content", "")).strip()
-                agency = str(row.get("news_agency_name", "")).strip()
-                
-                if not content or not title: continue
-
-                doc_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{url}-{title}"))
-                
+            for idx, row in df.iterrows():
                 try:
-                    raw_date = row.get("published_at")
-                    dt = pd.to_datetime(raw_date) if raw_date else datetime.now()
-                    ts = int(dt.timestamp())
-                    iso_date = dt.isoformat()
-                except Exception:
-                    dt = datetime.now()
-                    ts = int(dt.timestamp())
-                    iso_date = dt.isoformat()
+                    title = str(row.get("title", "")).strip()
+                    url = str(row.get("url", "")).strip()
+                    content = str(row.get("content", "")).strip()
+                    agency = str(row.get("news_agency_name", "")).strip()
+                    
+                    # Validation
+                    if not content:
+                        logger.warning(f"Job {job_id}, Chunk {chunk_num}, Row {idx}: Skipped - Missing content")
+                        failed_rows += 1
+                        continue
+                    
+                    if not title:
+                        logger.warning(f"Job {job_id}, Chunk {chunk_num}, Row {idx}: Skipped - Missing title")
+                        failed_rows += 1
+                        continue
 
-                es_docs.append({
-                    "doc_id": doc_id, "title": title, "content": content,
-                    "url": url, "news_agency_name": agency,
-                    "topic": str(row.get("topic", "")),
-                    "categories": str(row.get("categories", "")),
-                    "published_at": iso_date
-                })
+                    doc_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{url}-{title}"))
+                    
+                    # Date parsing with explicit error handling
+                    try:
+                        raw_date = row.get("published_at")
+                        if raw_date and str(raw_date).strip():
+                            dt = pd.to_datetime(raw_date)
+                        else:
+                            dt = datetime.now()
+                            logger.debug(f"Job {job_id}, Chunk {chunk_num}, Row {idx}: Using current time (no date provided)")
+                        
+                        ts = int(dt.timestamp())
+                        iso_date = dt.isoformat()
+                    except Exception as date_error:
+                        logger.warning(
+                            f"Job {job_id}, Chunk {chunk_num}, Row {idx}: "
+                            f"Invalid date '{row.get('published_at')}' - {date_error}. Using current time."
+                        )
+                        dt = datetime.now()
+                        ts = int(dt.timestamp())
+                        iso_date = dt.isoformat()
+
+                    es_docs.append({
+                        "doc_id": doc_id, 
+                        "title": title, 
+                        "content": content,
+                        "url": url, 
+                        "news_agency_name": agency,
+                        "topic": str(row.get("topic", "")),
+                        "categories": str(row.get("categories", "")),
+                        "published_at": iso_date
+                    })
+                    
+                    texts_to_embed.append(content)
+                    milvus_data_buffer["ids"].append(doc_id)
+                    milvus_data_buffer["timestamps"].append(ts)
                 
-                texts_to_embed.append(content)
-                milvus_data_buffer["ids"].append(doc_id)
-                milvus_data_buffer["timestamps"].append(ts)
+                except Exception as row_error:
+                    logger.error(
+                        f"Job {job_id}, Chunk {chunk_num}, Row {idx}: "
+                        f"Failed to process - {type(row_error).__name__}: {row_error}"
+                    )
+                    failed_rows += 1
+                    continue
 
-            if not es_docs: return 0
+            if not es_docs:
+                logger.warning(f"Job {job_id}, Chunk {chunk_num}: No valid documents to process")
+                return 0, failed_rows
 
             # 2. Embedding
             UPLOAD_JOBS.update(
@@ -231,15 +268,28 @@ class UploadService:
                 message=f"Embedding chunk {chunk_num}/{total_chunks} ({percent}%)"
             )
             
-            loop = asyncio.get_running_loop()
-            vectors: List[List[float]] = await loop.run_in_executor(
-                self._executor, 
-                self.embedder.embed_documents, 
-                texts_to_embed
-            )
-            
-            if len(vectors) != len(es_docs): return 0
-            milvus_data_buffer["embeddings"] = vectors
+            try:
+                loop = asyncio.get_running_loop()
+                vectors: List[List[float]] = await loop.run_in_executor(
+                    self._executor, 
+                    self.embedder.embed_documents, 
+                    texts_to_embed
+                )
+                
+                if len(vectors) != len(es_docs):
+                    logger.error(
+                        f"Job {job_id}, Chunk {chunk_num}: "
+                        f"Embedding count mismatch - Expected {len(es_docs)}, Got {len(vectors)}"
+                    )
+                    return 0, len(df)
+                
+                milvus_data_buffer["embeddings"] = vectors
+            except Exception as embed_error:
+                logger.error(
+                    f"Job {job_id}, Chunk {chunk_num}: "
+                    f"Embedding failed - {type(embed_error).__name__}: {embed_error}"
+                )
+                return 0, len(df)
 
             # 3. Indexing
             UPLOAD_JOBS.update(
@@ -248,20 +298,44 @@ class UploadService:
                 message=f"Indexing chunk {chunk_num}/{total_chunks} ({percent}%)"
             )
 
-            await loop.run_in_executor(
-                self._executor,
-                self.milvus.insert_vectors,
-                milvus_data_buffer["ids"], 
-                milvus_data_buffer["embeddings"], 
-                milvus_data_buffer["timestamps"]
-            )
-            await self.es.bulk_index(es_docs)
+            try:
+                # Milvus insertion
+                await loop.run_in_executor(
+                    self._executor,
+                    self.milvus.insert_vectors,
+                    milvus_data_buffer["ids"], 
+                    milvus_data_buffer["embeddings"], 
+                    milvus_data_buffer["timestamps"]
+                )
+            except Exception as milvus_error:
+                logger.error(
+                    f"Job {job_id}, Chunk {chunk_num}: "
+                    f"Milvus insertion failed - {type(milvus_error).__name__}: {milvus_error}"
+                )
+                return 0, len(df)
             
-            return len(es_docs)
+            try:
+                # Elasticsearch indexing
+                await self.es.bulk_index(es_docs)
+            except Exception as es_error:
+                logger.error(
+                    f"Job {job_id}, Chunk {chunk_num}: "
+                    f"Elasticsearch indexing failed - {type(es_error).__name__}: {es_error}"
+                )
+                return 0, len(df)
+            
+            logger.info(
+                f"Job {job_id}, Chunk {chunk_num}: "
+                f"Successfully processed {len(es_docs)} documents, {failed_rows} failed"
+            )
+            return len(es_docs), failed_rows
 
         except Exception as e:
-            logger.error(f"Chunk {chunk_num} error: {e}")
-            return 0
+            logger.error(
+                f"Job {job_id}, Chunk {chunk_num}: "
+                f"Unexpected error - {type(e).__name__}: {e}"
+            )
+            return 0, len(df)
 
 def get_upload_service(
     milvus_client: MilvusClient, 
