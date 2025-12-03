@@ -107,9 +107,9 @@ EMBEDDING_DIMENSION=1024
 EMBEDDING_BATCH_SIZE=64
 EMBEDDING_DEVICE=cpu
 
-# [NEW] Resource Management & Model Specifics
+# --- Resource Management & Model Specifics ---
 EMBEDDING_CONTEXT_LENGTH=32768
-# Qwen2-0.5B has 24 layers. Set to 24.
+# Qwen3-0.6B has 24 layers. Set to 24.
 EMBEDDING_MODEL_LAYERS=24
 EMBEDDING_DOCUMENT_PREFIX="passage: "
 EMBEDDING_QUERY_PREFIX="query: "
@@ -121,7 +121,7 @@ LLM_API_KEY=your-api-key
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_MODEL=gpt-5.1
 LLM_TEMPERATURE=0.1
-# UPDATED: Set to 32k for long document generation
+# Set to 32k for long document generation
 LLM_MAX_COMPLETION_TOKENS=32768
 # GPT-5.1 supports up to 400k tokens via API
 LLM_CONTEXT_WINDOW=400000
