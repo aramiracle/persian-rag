@@ -24,7 +24,7 @@ Production-ready RAG system for Persian news with hybrid search using RRF fusion
                         ▼                     ▼
                 ┌───────────────┐    ┌────────────────┐
                 │    Milvus     │    │ Elasticsearch  │
-                │  (Vectors)    │    │  (BM25+ Index)  │
+                │  (Vectors)    │    │  (BM25+ Index) │
                 └───────────────┘    └────────────────┘
 ```
 
