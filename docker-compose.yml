@@ -1,0 +1,169 @@
+services:
+  # ---------------------------------------------------------
+  # Setup Service (Fixes Permissions)
+  # ---------------------------------------------------------
+  setup:
+    image: alpine:3.18
+    container_name: setup-permissions
+    # Change ownership of the volume to UID 1000 (Elasticsearch user)
+    command: sh -c "chown -R 1000:1000 /usr/share/elasticsearch/data"
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/elasticsearch:/usr/share/elasticsearch/data
+    networks:
+      - backend
+
+  # ---------------------------------------------------------
+  # Infrastructure Services — Milvus dependencies
+  # ---------------------------------------------------------
+  etcd:
+    container_name: milvus-etcd
+    image: quay.io/coreos/etcd:v3.6.6
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/etcd:/etcd
+    command: >
+      etcd
+      -advertise-client-urls=http://milvus-etcd:2379
+      -listen-client-urls=http://0.0.0.0:2379
+      -data-dir=/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - backend
+
+  minio:
+    container_name: milvus-minio
+    image: quay.io/minio/minio:latest
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/minio:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - backend
+
+  # ---------------------------------------------------------
+  # Milvus Standalone
+  # ---------------------------------------------------------
+  milvus:
+    container_name: milvus-standalone
+    image: milvusdb/milvus:v2.6.5
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: milvus-etcd:2379
+      MINIO_ADDRESS: milvus-minio:9000
+      MINIO_ACCESS_KEY_ID: minioadmin
+      MINIO_SECRET_ACCESS_KEY: minioadmin
+    depends_on:
+      - etcd
+      - minio
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/milvus:/var/lib/milvus
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    networks:
+      - backend
+
+  # ---------------------------------------------------------
+  # Elasticsearch 9.2.0 (Independent)
+  # ---------------------------------------------------------
+  elasticsearch:
+    container_name: elasticsearch
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.2.0
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms2g -Xmx2g
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/elasticsearch:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - backend
+
+  # ---------------------------------------------------------
+  # Backend
+  # ---------------------------------------------------------
+  backend:
+    container_name: backend
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - HF_HOME=/app/models/cache
+    depends_on:
+      milvus:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - ./models:/app/models
+      - ./backend:/app/backend
+      - ./storage:/app/storage
+    restart: unless-stopped
+    networks:
+      - backend
+
+  # ---------------------------------------------------------
+  # Frontend
+  # ---------------------------------------------------------
+  frontend:
+    container_name: frontend
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    ports:
+      - "7860:7860"
+    depends_on:
+      - backend
+    environment:
+      - BACKEND_URL=http://backend:8000/api/v1
+    restart: unless-stopped
+    networks:
+      - backend
+
+# ---------------------------------------------------------
+# Networks
+# ---------------------------------------------------------
+networks:
+  backend:
+    driver: bridge
