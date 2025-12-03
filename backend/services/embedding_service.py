@@ -3,6 +3,7 @@ import time
 import threading
 from typing import List, Optional
 from collections import deque
+import asyncio
 
 import numpy as np
 from loguru import logger
@@ -14,7 +15,6 @@ LLAMA_POOLING_TYPE_MEAN = 1
 class EmbeddingRequest:
     """
     Lightweight holder for request data and synchronization primitives.
-    Avoids overhead of complex objects.
     """
     __slots__ = ('texts', 'event', 'result', 'error', 'created_at')
     
@@ -38,9 +38,9 @@ class EmbeddingService:
         self._initialized = False
         
         # --- Custom Priority Queue using Deque ---
-        # High Priority: Search Queries
+        # High Priority: Search Queries (LIFO/FIFO doesn't matter much for small volume, FIFO used)
         self._high_prio_queue: deque = deque()
-        # Low Priority: Document Upload Chunks
+        # Low Priority: Document Upload Chunks (FIFO)
         self._low_prio_queue: deque = deque()
         
         # Synchronization
@@ -78,42 +78,45 @@ class EmbeddingService:
     def _worker_loop(self) -> None:
         """
         Worker loop using Condition Variables for low-latency wakeups.
-        Checks High Priority queue strictly before Low Priority.
+        Strictly prioritizes High Priority queue.
         """
-        logger.info("Embedding worker loop started (Deque Mode)")
+        logger.info("Embedding worker loop started (Priority Deque Mode)")
         
         while True:
             req: Optional[EmbeddingRequest] = None
             
-            # 1. Acquire Lock & Wait for Work
             with self._cv:
+                # 1. Wait until there is work or stop signal
                 while (not self._high_prio_queue and not self._low_prio_queue) and not self._stop_event:
-                    self._cv.wait() # Releases lock and sleeps until notified
+                    self._cv.wait()
                 
                 if self._stop_event:
                     break
 
                 # 2. Strict Priority Selection
+                # Always check high priority first.
                 if self._high_prio_queue:
                     req = self._high_prio_queue.popleft()
                 elif self._low_prio_queue:
                     req = self._low_prio_queue.popleft()
             
-            # 3. Process (Outside Lock)
+            # 3. Process (Outside Lock to allow new submissions)
             if req:
                 self._process_request_safe(req)
 
     def _process_request_safe(self, req: EmbeddingRequest) -> None:
         try:
-            # Drop stale requests (> 5 mins old)
+            # Drop stale requests (> 5 mins old) to prevent queue clogging
             if time.time() - req.created_at > 300:
                 logger.warning("Dropping stale embedding request")
+                req.error = TimeoutError("Request dropped due to ttl")
                 return
 
+            # Compute logic
             embeddings = self._compute_batch(req.texts)
             req.result = embeddings
         except Exception as e:
-            logger.error(f"Embedding failed: {e}")
+            logger.error(f"Embedding processing failed: {e}")
             req.error = e
         finally:
             # Wake up the waiter
@@ -125,6 +128,8 @@ class EmbeddingService:
         
         embeddings = []
         # Process in model's native batch size
+        # This loop is usually short because 'texts' comes pre-chunked (micro-batches)
+        # from embed_documents.
         for i in range(0, len(texts), self.batch_size):
             batch = texts[i:i + self.batch_size]
             
@@ -172,20 +177,22 @@ class EmbeddingService:
         
         processed_texts = [f"{self.doc_prefix}{' '.join(t.split())}" for t in texts]
         
-        # Create requests for micro-batches
+        # 1. Create requests for micro-batches
+        # We break the large document list into small chunks (size of model batch)
+        # This ensures the worker returns to the loop frequently to check for high-priority queries.
         micro_batches = []
         for i in range(0, len(processed_texts), self.batch_size):
             batch = processed_texts[i : i + self.batch_size]
             micro_batches.append(EmbeddingRequest(batch))
         
-        # Enqueue all batches
+        # 2. Enqueue all batches
         with self._cv:
             for req in micro_batches:
                 self._low_prio_queue.append(req)
             self._cv.notify(n=len(micro_batches))
             
-        # Wait for results sequentially
-        # This blocks the Upload Worker, but not the Embedding Worker
+        # 3. Wait for results sequentially
+        # This blocks the calling thread (UploadService), but NOT the Embedding Worker.
         results = []
         try:
             for req in micro_batches:

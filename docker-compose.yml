@@ -3,7 +3,7 @@ services:
   # Setup Service (Fixes Permissions)
   # ---------------------------------------------------------
   setup:
-    image: alpine:3.18
+    image: alpine:3.22.2
     container_name: setup-permissions
     # Change ownership of the volume to UID 1000 (Elasticsearch user)
     command: sh -c "chown -R 1000:1000 /usr/share/elasticsearch/data"
@@ -40,7 +40,8 @@ services:
 
   minio:
     container_name: milvus-minio
-    image: quay.io/minio/minio:latest
+    # Switched to quay.io (Official Active Registry) and pinned to a verified 2025 release
+    image: quay.io/minio/minio:RELEASE.2025-01-20T14-49-07Z
     environment:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
@@ -96,7 +97,8 @@ services:
     environment:
       - discovery.type=single-node
       - xpack.security.enabled=false
-      - ES_JAVA_OPTS=-Xms2g -Xmx2g
+      # Increased memory to 4GB for production scale
+      - ES_JAVA_OPTS=-Xms4g -Xmx4g
     ulimits:
       memlock:
         soft: -1

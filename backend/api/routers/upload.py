@@ -1,5 +1,5 @@
 import uuid
-import shutil
+import asyncio
 from pathlib import Path
 from fastapi import APIRouter, Depends, File, UploadFile, BackgroundTasks, HTTPException
 from backend.api.dependencies import get_upload_service_dependency
@@ -9,36 +9,43 @@ from backend.core.config import settings
 router = APIRouter(prefix="/upload", tags=["Upload"])
 
 @router.post("/csv", status_code=202)
-def upload_csv(
+async def upload_csv(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     upload_service: UploadService = Depends(get_upload_service_dependency),
 ):
     """
     Handles massive CSV uploads by streaming the file to a temporary location
-    using standard I/O in a threadpool (no async/await for file write).
+    asynchronously to avoid blocking the Main Thread or holding a ThreadPool worker
+    for the entire duration of the I/O.
     """
     if not file.filename.endswith(".csv"):
         raise HTTPException(status_code=400, detail="File must be a CSV")
 
     job_id = str(uuid.uuid4())
     
-    # 1. Use configured path (No hardcoding)
+    # 1. Use configured path
     temp_dir = Path(settings.upload.temp_dir)
     temp_dir.mkdir(parents=True, exist_ok=True)
     
     file_path = temp_dir / f"{job_id}.csv"
 
-    # 2. Stream content to disk using standard shutil
-    #    Since this is a 'def' route, FastAPI runs it in a threadpool, 
-    #    so blocking I/O here is safe and efficient.
+    # 2. Async Stream to Disk
+    # using run_in_executor for the synchronous write call to avoid blocking
+    chunk_size = 1024 * 1024 # 1MB chunks
+    
     try:
+        loop = asyncio.get_running_loop()
         with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            while True:
+                content = await file.read(chunk_size)
+                if not content:
+                    break
+                await loop.run_in_executor(None, buffer.write, content)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
     finally:
-        file.file.close()
+        await file.close()
 
     # 3. Initialize Job
     UPLOAD_JOBS.create_sync(job_id)

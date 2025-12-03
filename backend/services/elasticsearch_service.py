@@ -21,14 +21,36 @@ class ElasticsearchService:
         try:
             exists = await self.client.indices.exists(index=self.index_name)
             
+            # Optimized Persian Analyzer Configuration
             index_config = {
                 "settings": {
                     "number_of_shards": 1, 
                     "number_of_replicas": 0,
                     "analysis": {
+                        "char_filter": {
+                            "zero_width_spaces": {
+                                "type": "mapping",
+                                "mappings": ["\\u200C=> "] 
+                            }
+                        },
+                        "filter": {
+                            "persian_stop": {
+                                "type": "stop", 
+                                "stopwords": "_persian_"
+                            }
+                        },
                         "analyzer": {
                             "persian_optimized": {
-                                "type": "persian" 
+                                "type": "custom",
+                                "tokenizer": "standard",
+                                "char_filter": ["zero_width_spaces"],
+                                "filter": [
+                                    "lowercase",
+                                    "decimal_digit",
+                                    "arabic_normalization", 
+                                    "persian_normalization",
+                                    "persian_stop"
+                                ]
                             }
                         }
                     },
@@ -75,7 +97,7 @@ class ElasticsearchService:
     async def bulk_index(self, documents: List[Dict[str, Any]]) -> Tuple[int, int]:
         actions = [{ "_index": self.index_name, "_id": doc["doc_id"], "_source": doc } for doc in documents]
         try:
-            # refresh=True ensures the documents are immediately searchable and visible to count API
+            # refresh=True ensures the documents are immediately searchable
             success, failed = await helpers.async_bulk(self.client, actions, refresh=True)
             
             logger.info(f"ES: Indexed {success} documents (Failed: {len(failed) if isinstance(failed, list) else 0})")
@@ -86,6 +108,10 @@ class ElasticsearchService:
             raise
 
     async def search(self, query: str, top_k: int = 10) -> List[Tuple[str, float]]:
+        """
+        Search for documents where ALL query terms must exist (operator: "and").
+        Uses 'cross_fields' to allow terms to match across title and content.
+        """
         if not query or not query.strip(): return []
         
         search_body = {
@@ -95,7 +121,8 @@ class ElasticsearchService:
                 "multi_match": {
                     "query": query,
                     "fields": ["title^2", "content"],
-                    "type": "phrase_prefix"
+                    "type": "cross_fields",  # Best type for structured text search
+                    "operator": "and"        # Forces ALL words to be present
                 }
             }
         }
@@ -108,6 +135,10 @@ class ElasticsearchService:
             return []
 
     async def get_bm25_scores(self, query: str, doc_ids: List[str]) -> Dict[str, float]:
+        """
+        Calculate BM25 scores for specific documents.
+        Also enforces 'operator: and' to ensure scoring consistency.
+        """
         if not query or not doc_ids: return {}
         
         search_body = {
@@ -116,7 +147,14 @@ class ElasticsearchService:
             "query": {
                 "bool": {
                     "must": [
-                        {"multi_match": {"query": query, "fields": ["title", "content"], "type": "phrase_prefix"}}
+                        {
+                            "multi_match": {
+                                "query": query,
+                                "fields": ["title", "content"],
+                                "type": "cross_fields", 
+                                "operator": "and" # Only score if strict match criteria is met
+                            }
+                        }
                     ],
                     "filter": [
                         {"ids": {"values": doc_ids}}
@@ -126,6 +164,7 @@ class ElasticsearchService:
         }
         try:
             resp = await self.client.search(index=self.index_name, body=search_body)
+            # Map doc_id -> score. Docs that don't satisfy the "and" operator won't be returned here.
             return {hit['_id']: hit['_score'] for hit in resp['hits']['hits']}
         except Exception as e:
             logger.error(f"ES Cross-Score failed: {e}")

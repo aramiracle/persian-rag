@@ -23,6 +23,8 @@ class MilvusClient:
         self._mgmt_lock = threading.RLock()
         self._index_built = False
         self.output_fields = ["doc_id"] 
+        # Explicitly define the vector index name to prevent AmbiguousIndexName errors
+        self.vector_index_name = "vector_index"
 
     def connect(self) -> None:
         with self._mgmt_lock:
@@ -42,17 +44,19 @@ class MilvusClient:
                         logger.warning(f"Collection '{self.collection_name}' exists but is empty. Skipping load.")
                         return
                     
-                    if self._collection.has_index():
+                    # FIX: Specify index_name to check specifically for the vector index
+                    if self._collection.has_index(index_name=self.vector_index_name):
                         self._index_built = True
                     
                     try:
                         self._collection.load()
                         logger.info(f"Collection '{self.collection_name}' loaded. Entities: {self._collection.num_entities}")
                     except MilvusException as e:
+                        # If index not found (or loaded), attempt to build/load safely
                         if "index not found" in str(e) or e.code == 700:
                             logger.info("Index not found. Attempting to build...")
                             self._build_index_safe()
-                            if self._collection.has_index():
+                            if self._collection.has_index(index_name=self.vector_index_name):
                                 self._collection.load()
                         else:
                             raise e
@@ -98,7 +102,8 @@ class MilvusClient:
                 if self._collection.num_entities < settings.milvus.index_build_threshold:
                     return
 
-                if self._collection.has_index():
+                # FIX: Check specific index name
+                if self._collection.has_index(index_name=self.vector_index_name):
                     self._index_built = True
                     return
 
@@ -115,14 +120,15 @@ class MilvusClient:
                         "metric_type": settings.milvus.metric_type,
                         "params": index_params,
                     },
-                    index_name="vector_index"
+                    index_name=self.vector_index_name
                 )
                 self._index_built = True
                 
-                # Create scalar index
+                # Create scalar index for doc_id (optional, but good for hybrid logic)
                 try:
                     self._collection.create_index(field_name="doc_id", index_name="doc_id_index")
-                except: pass
+                except Exception: 
+                    pass
                 
                 logger.info("Milvus Index built successfully.")
                     
@@ -139,12 +145,11 @@ class MilvusClient:
             # 1. Insert (In-Memory)
             res = self._collection.insert(data)
             
-            # 2. FORCE FLUSH: This forces Milvus to seal the segment and update 'num_entities'.
-            #    This is blocking, but essential for the UI to see the count update in real-time.
-            #    Since this runs in a ThreadExecutor (from upload_service), it won't block the API.
+            # 2. FORCE FLUSH (Kept per your request for live data visibility)
+            # This ensures data is immediately visible in search at the cost of performance.
             self._collection.flush()
             
-            logger.info(f"Milvus: Inserted {len(doc_ids)} vectors. Total Entities: {self._collection.num_entities}")
+            logger.info(f"Milvus: Inserted {len(doc_ids)} vectors and Flushed.")
 
             # 3. Check Index
             if not self._index_built:
@@ -174,19 +179,24 @@ class MilvusClient:
                 "params": {"nprobe": settings.milvus.nprobe}
             }
             
+            # FIX: Specify index_name to ensure we use the Vector Index
             results = self._collection.search(
                 data=[query_embedding],
                 anns_field="embedding",
                 param=search_params,
                 limit=top_k,
                 output_fields=self.output_fields,
-                index_name="vector_index"
+                index_name=self.vector_index_name
             )
         except MilvusException as e:
-            # Reload if needed
+            # Reload if needed (e.g., if index was dropped or segment released)
             if "not loaded" in str(e).lower() or e.code == 700:
                 with self._mgmt_lock:
-                    self._collection.load()
+                    try:
+                        self._collection.load()
+                    except Exception as load_err:
+                        logger.error(f"Failed to reload collection: {load_err}")
+                        return []
                 return self.search(query_embedding, top_k)
             logger.error(f"Search error: {e}")
             raise
@@ -219,7 +229,7 @@ class MilvusClient:
         if not self._collection:
             return {"status": "disconnected"}
         
-        # This count will only be accurate if flush() was called recently
+        # This count is accurate because flush() is called on insert
         count = self._collection.num_entities
         return {"status": "up", "approx_count": count}
 
