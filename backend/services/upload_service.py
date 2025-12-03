@@ -58,8 +58,11 @@ class UploadService:
         self.milvus = milvus_client
         self.es = es_service
         self.embedder = embedding_service
-        # Thread pool for blocking operations
-        self._executor = ThreadPoolExecutor(max_workers=3)
+        # Dedicated thread pool for uploads (separate from system pool)
+        self._executor = ThreadPoolExecutor(
+            max_workers=2, 
+            thread_name_prefix="upload_worker"
+        )
 
     def _count_total_rows_exact(self, file_path: str) -> int:
         try:
@@ -107,8 +110,9 @@ class UploadService:
             ) as reader:
                 
                 for chunk_num, df in enumerate(reader, start=1):
-                    # Vital: Give the event loop a breather to handle Search requests
-                    await asyncio.sleep(0.1)
+                    # CRITICAL: Yield control to event loop frequently
+                    # This allows search requests to be processed
+                    await asyncio.sleep(0.2)
 
                     if df.empty:
                         continue
@@ -173,7 +177,7 @@ class UploadService:
             
             df.columns = [c.lower().strip() for c in df.columns]
 
-            # 1. Parsing
+            # 1. Parsing (Fast, no blocking)
             for idx, row in df.iterrows():
                 try:
                     title = str(row.get("title", "")).strip()
@@ -222,10 +226,11 @@ class UploadService:
             if not es_docs:
                 return 0, failed_rows
 
-            # 2. Embedding (Run in executor to avoid blocking loop)
+            # 2. Embedding (Now queued with lower priority)
             UPLOAD_JOBS.update(job_id, percent, f"Embedding chunk {chunk_num}/{total_chunks} ({percent}%)")
             
             loop = asyncio.get_running_loop()
+            # Run in executor but the actual embedding is queued in worker thread
             vectors: List[List[float]] = await loop.run_in_executor(
                 self._executor, 
                 self.embedder.embed_documents, 
@@ -233,26 +238,30 @@ class UploadService:
             )
             milvus_data_buffer["embeddings"] = vectors
 
-            # 3. Indexing
+            # 3. Indexing (Non-blocking operations)
             UPLOAD_JOBS.update(job_id, percent, f"Indexing chunk {chunk_num}/{total_chunks} ({percent}%)")
 
-            # Milvus insertion (Now thread-safe and non-blocking via modified MilvusClient)
-            await loop.run_in_executor(
-                self._executor,
-                self.milvus.insert_vectors,
-                milvus_data_buffer["ids"], 
-                milvus_data_buffer["embeddings"], 
-                milvus_data_buffer["timestamps"]
+            # Both operations are now non-blocking
+            await asyncio.gather(
+                loop.run_in_executor(
+                    self._executor,
+                    self.milvus.insert_vectors,
+                    milvus_data_buffer["ids"], 
+                    milvus_data_buffer["embeddings"], 
+                    milvus_data_buffer["timestamps"]
+                ),
+                self.es.bulk_index(es_docs)
             )
-            
-            # Elasticsearch indexing
-            await self.es.bulk_index(es_docs)
             
             return len(es_docs), failed_rows
 
         except Exception as e:
             logger.error(f"Chunk error: {e}")
             return 0, len(df)
+
+    async def cleanup(self) -> None:
+        """Cleanup resources"""
+        self._executor.shutdown(wait=False)
 
 def get_upload_service(
     milvus_client: MilvusClient, 
