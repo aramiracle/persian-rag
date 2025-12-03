@@ -243,7 +243,7 @@ def upload_csv_with_progress(file_path, progress=gr.Progress()):
                 status_res.raise_for_status()
                 status_data = status_res.json()
             except Exception:
-                time.sleep(1)
+                time.sleep(10)
                 continue
 
             state = status_data.get("status", "unknown").lower()
@@ -275,7 +275,7 @@ def upload_csv_with_progress(file_path, progress=gr.Progress()):
                 yield f"## ❌ Processing Failed\n**Reason:** {msg}"
                 return
             
-            time.sleep(0.5)
+            time.sleep(5)
 
     except Exception as e:
         yield f"❌ **Exception:** {str(e)}"
