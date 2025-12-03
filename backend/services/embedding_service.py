@@ -21,7 +21,11 @@ class EmbeddingService:
         self.query_prefix = getattr(settings.embedding, 'query_prefix', "query: ")
         self._model = None
         self._initialized = False
+        
+        # Lock for initialization
         self._init_lock = threading.Lock()
+        # Lock for inference (Critical for thread safety and preventing deadlocks)
+        self._model_lock = threading.Lock()
 
     def initialize(self) -> None:
         with self._init_lock:
@@ -53,19 +57,22 @@ class EmbeddingService:
             return []
 
         embeddings = []
-        # Removed lock to allow parallel calls if supported by runtime/hardware
-        for i in range(0, len(texts), self.batch_size):
-            batch = texts[i:i + self.batch_size]
-            
-            result = self._model.create_embedding(batch)
-            vectors = np.array([item["embedding"] for item in result["data"]], dtype=np.float32)
+        
+        # CRITICAL FIX: Lock the model during inference.
+        # This ensures llama.cpp context is not accessed concurrently.
+        with self._model_lock:
+            for i in range(0, len(texts), self.batch_size):
+                batch = texts[i:i + self.batch_size]
+                
+                result = self._model.create_embedding(batch)
+                vectors = np.array([item["embedding"] for item in result["data"]], dtype=np.float32)
 
-            if self.dimension < vectors.shape[1]:
-                vectors = vectors[:, :self.dimension]
+                if self.dimension < vectors.shape[1]:
+                    vectors = vectors[:, :self.dimension]
 
-            norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-            norms[norms == 0] = 1
-            embeddings.extend((vectors / norms).tolist())
+                norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+                norms[norms == 0] = 1
+                embeddings.extend((vectors / norms).tolist())
 
         return embeddings
 
@@ -92,6 +99,7 @@ class EmbeddingService:
         if not self._initialized:
             return {"status": "down", "error": "Not initialized"}
         try:
+            # Simple check, effectively tests lock acquisition too
             self.embed_query("test")
             return {"status": "up", "dimension": self.dimension}
         except Exception as e:

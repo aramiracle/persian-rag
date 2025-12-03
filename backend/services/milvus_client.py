@@ -20,12 +20,13 @@ class MilvusClient:
         self.dimension = settings.milvus.dimension
         self.alias = "default"
         self._collection: Optional[Collection] = None
-        self._lock = threading.RLock()
-        self._index_built = False  # Track if index has been built
+        # Lock only for connection/disconnection/index_building
+        self._mgmt_lock = threading.RLock()
+        self._index_built = False
         self.output_fields = ["doc_id"] 
 
     def connect(self) -> None:
-        with self._lock:
+        with self._mgmt_lock:
             try:
                 if not connections.has_connection(self.alias):
                     connections.connect(
@@ -38,12 +39,10 @@ class MilvusClient:
                 if utility.has_collection(self.collection_name):
                     self._collection = Collection(self.collection_name)
                     
-                    # Check if collection has data before attempting to load
                     if self._collection.num_entities == 0:
                         logger.warning(f"Collection '{self.collection_name}' exists but is empty. Skipping load.")
                         return
                     
-                    # Check if index already exists
                     if self._collection.has_index():
                         self._index_built = True
                     
@@ -51,21 +50,11 @@ class MilvusClient:
                         self._collection.load()
                         logger.info(f"Collection '{self.collection_name}' loaded.")
                     except MilvusException as e:
-                        # Index not found - try to build if we have enough data
                         if "index not found" in str(e) or e.code == 700:
                             logger.info("Index not found. Attempting to build...")
                             self._build_index_safe()
-                            
-                            # Only load if index was successfully built
                             if self._collection.has_index():
                                 self._collection.load()
-                                logger.info(f"Collection '{self.collection_name}' loaded after index build.")
-                            else:
-                                logger.warning(
-                                    f"Collection '{self.collection_name}' has insufficient data "
-                                    f"({self._collection.num_entities} < {settings.milvus.index_build_threshold}). "
-                                    "Collection ready but not loaded."
-                                )
                         else:
                             raise e
                 else:
@@ -77,7 +66,7 @@ class MilvusClient:
                 raise
 
     def disconnect(self) -> None:
-        with self._lock:
+        with self._mgmt_lock:
             if self._collection:
                 self._collection.release()
                 self._collection = None
@@ -93,40 +82,34 @@ class MilvusClient:
         schema = CollectionSchema(fields=fields, description="Persian News Vectors")
         self._collection = Collection(name=self.collection_name, schema=schema)
         logger.info(f"Collection '{self.collection_name}' created (Empty/No Index).")
-        # Do NOT build index or load here. Wait for data.
 
     def _build_index_safe(self) -> None:
         """
-        Safely builds index only if data exceeds threshold and index doesn't exist.
+        Thread-safe index building.
         """
-        if not self._collection:
-            return
-        
-        # Prevent duplicate index creation
-        if self._index_built:
-            logger.debug("Index already built, skipping.")
-            return
-        
-        try:
-            # Check approximate count
-            if self._collection.num_entities < settings.milvus.index_build_threshold:
-                logger.info(f"Skipping index build: Not enough entities ({self._collection.num_entities} < {settings.milvus.index_build_threshold})")
+        # Double check locking here to ensure only one thread builds the index
+        with self._mgmt_lock:
+            if not self._collection:
                 return
-
-            # Double-check if index exists (race condition protection)
-            if self._collection.has_index():
-                logger.info("Index already exists (detected during build check).")
-                self._index_built = True
-                return
-
-            logger.info("Building Milvus Index...")
-            index_params = {"nlist": settings.milvus.nlist}
-            if settings.milvus.index_type == "IVF_PQ":
-                index_params["m"] = settings.milvus.m 
-                index_params["nbits"] = settings.milvus.nbits
             
-            # Build vector index
+            if self._index_built:
+                return
+            
             try:
+                # Check approximate count
+                if self._collection.num_entities < settings.milvus.index_build_threshold:
+                    return
+
+                if self._collection.has_index():
+                    self._index_built = True
+                    return
+
+                logger.info("Building Milvus Index...")
+                index_params = {"nlist": settings.milvus.nlist}
+                if settings.milvus.index_type == "IVF_PQ":
+                    index_params["m"] = settings.milvus.m 
+                    index_params["nbits"] = settings.milvus.nbits
+                
                 self._collection.create_index(
                     field_name="embedding",
                     index_params={
@@ -136,31 +119,15 @@ class MilvusClient:
                     },
                     index_name="vector_index"
                 )
-                logger.info("Vector index built successfully.")
                 self._index_built = True
-            except MilvusException as e:
-                # Index might already exist from another process
-                if "index already exist" in str(e).lower() or "duplicate" in str(e).lower():
-                    logger.info("Vector index already exists (created by another process).")
-                    self._index_built = True
-                else:
-                    logger.warning(f"Vector index creation warning: {e}")
-
-            # Build scalar index on doc_id
-            try:
-                self._collection.create_index(
-                    field_name="doc_id",
-                    index_name="doc_id_index"
-                )
-                logger.info("Scalar index built successfully.")
-            except MilvusException as e:
-                if "index already exist" in str(e).lower() or "duplicate" in str(e).lower():
-                    logger.debug("Scalar index already exists.")
-                else:
-                    logger.warning(f"Scalar index creation warning: {e}")
                 
-        except Exception as e:
-            logger.error(f"Index build failed: {e}")
+                # Create scalar index
+                try:
+                    self._collection.create_index(field_name="doc_id", index_name="doc_id_index")
+                except: pass
+                    
+            except Exception as e:
+                logger.error(f"Index build failed: {e}")
 
     def insert_vectors(self, doc_ids: List[str], embeddings: List[List[float]], timestamps: List[int]) -> List[int]:
         if not self._collection:
@@ -168,61 +135,57 @@ class MilvusClient:
         
         data = [doc_ids, embeddings, timestamps]
         
-        with self._lock:
-            result = self._collection.insert(data)
-            
-            # Auto-index if threshold reached and no index exists
-            if not self._index_built and self._collection.num_entities >= settings.milvus.index_build_threshold:
+        # NO LOCK HERE - Allow concurrent searches while inserting
+        res = self._collection.insert(data)
+        
+        # Check if we need to build index (using lock internally)
+        if not self._index_built:
+            # Only acquire lock if we suspect we need to build
+            if self._collection.num_entities >= settings.milvus.index_build_threshold:
                 self._build_index_safe()
-                
-                # Attempt to load collection for future searches
-                if self._index_built:
-                    try:
-                        self._collection.load()
-                        logger.info("Collection loaded automatically after index build.")
-                    except Exception as load_error:
-                        logger.warning(f"Failed to auto-load collection: {load_error}")
+                # Try to load if we just built it
+                with self._mgmt_lock:
+                    if self._index_built:
+                        try:
+                            self._collection.load()
+                        except: pass
 
-        return list(result.primary_keys)
+        return list(res.primary_keys)
 
     def search(self, query_embedding: List[float], top_k: int = 10) -> List[Dict[str, Any]]:
         if not self._collection: 
             raise RuntimeError("Milvus disconnected")
         
-        with self._lock:
-            # Early return if collection is empty
-            if self._collection.num_entities == 0:
-                logger.debug("Search skipped: Collection is empty.")
-                return []
+        # NO LOCK HERE - Search should run freely
+        if self._collection.num_entities == 0:
+            return []
+        
+        try:
+            # Pymilvus handles load check internally usually, but we can double check light-weight
+            # or just let it fail if not loaded.
             
-            try:
-                # Only load if not already loaded
-                if not hasattr(self._collection, '_is_loaded') or not self._collection._is_loaded:
+            search_params = {
+                "metric_type": settings.milvus.metric_type, 
+                "params": {"nprobe": settings.milvus.nprobe}
+            }
+            
+            results = self._collection.search(
+                data=[query_embedding],
+                anns_field="embedding",
+                param=search_params,
+                limit=top_k,
+                output_fields=self.output_fields,
+                index_name="vector_index"
+            )
+        except MilvusException as e:
+            # If collection not loaded, try to load it safely
+            if "not loaded" in str(e).lower() or e.code == 700:
+                with self._mgmt_lock:
                     self._collection.load()
-                
-                search_params = {
-                    "metric_type": settings.milvus.metric_type, 
-                    "params": {"nprobe": settings.milvus.nprobe}
-                }
-                
-                results = self._collection.search(
-                    data=[query_embedding],
-                    anns_field="embedding",
-                    param=search_params,
-                    limit=top_k,
-                    output_fields=self.output_fields,
-                    # Explicitly specify index name to avoid ambiguity
-                    index_name="vector_index"
-                )
-            except MilvusException as e:
-                if "index not found" in str(e) or e.code == 700 or "not loaded" in str(e).lower():
-                    logger.warning("Search failed: Collection not indexed/loaded yet.")
-                    return []
-                logger.error(f"Search error: {e}")
-                raise
-            except Exception as e:
-                logger.error(f"Unexpected search error: {e}")
-                raise
+                # Retry once
+                return self.search(query_embedding, top_k)
+            logger.error(f"Search error: {e}")
+            raise
 
         hits = []
         if results:
@@ -237,19 +200,13 @@ class MilvusClient:
         if not self._collection or not doc_ids:
             return {}
 
+        # NO LOCK HERE
         ids_expr = str(doc_ids)
         try:
-            with self._lock:
-                # Same safety check as search
-                try:
-                    self._collection.load()
-                except:
-                    return {}
-                    
-                res = self._collection.query(
-                    expr=f"doc_id in {ids_expr}",
-                    output_fields=["doc_id", "embedding"]
-                )
+            res = self._collection.query(
+                expr=f"doc_id in {ids_expr}",
+                output_fields=["doc_id", "embedding"]
+            )
             return {item["doc_id"]: item["embedding"] for item in res}
         except Exception as e:
             logger.error(f"Failed to fetch vectors: {e}")

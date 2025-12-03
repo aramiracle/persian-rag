@@ -62,19 +62,10 @@ class UploadService:
         self._executor = ThreadPoolExecutor(max_workers=3)
 
     def _count_total_rows_exact(self, file_path: str) -> int:
-        """
-        Counts logical CSV rows using the CSV parser.
-        This correctly handles newlines inside quoted fields (multiline text).
-        """
         try:
-            # Using csv.reader is memory safe (streaming) and respects quotes.
-            # We open with errors='ignore' to avoid crashing on encoding issues during simple counting.
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                 reader = csv.reader(f)
-                # Efficiently count items in iterator
                 row_count = sum(1 for _ in reader)
-            
-            # Subtract 1 for header
             return max(row_count - 1, 0)
         except Exception as e:
             logger.error(f"Error counting CSV rows: {e}")
@@ -90,9 +81,8 @@ class UploadService:
         failed_count = 0
         
         try:
-            # --- STEP 1: Exact Row Count (Parser Aware) ---
+            # STEP 1: Exact Row Count
             UPLOAD_JOBS.update(job_id, 0, "Scanning file for exact row count...")
-            
             loop = asyncio.get_running_loop()
             total_rows = await loop.run_in_executor(
                 self._executor, 
@@ -102,14 +92,12 @@ class UploadService:
             
             if total_rows == 0:
                 total_chunks = 1
-                logger.warning(f"Job {job_id}: File appears empty or header-only.")
             else:
                 total_chunks = math.ceil(total_rows / chunk_size)
 
             logger.info(f"Job {job_id}: Logical Rows: {total_rows} | Total Chunks: {total_chunks}")
             
-            # --- STEP 2: Process Chunks ---
-            # We reopen the file with Pandas for processing
+            # STEP 2: Process Chunks
             with pd.read_csv(
                 file_path, 
                 chunksize=chunk_size, 
@@ -119,23 +107,20 @@ class UploadService:
             ) as reader:
                 
                 for chunk_num, df in enumerate(reader, start=1):
-                    # Yield to event loop
-                    await asyncio.sleep(0)
+                    # Vital: Give the event loop a breather to handle Search requests
+                    await asyncio.sleep(0.1)
 
                     if df.empty:
                         continue
                     
-                    # Calculate granular progress
-                    # We define progress as "Starting to process chunk N"
                     current_percent = int(((chunk_num - 1) / total_chunks) * 100)
                     
                     UPLOAD_JOBS.update(
                         job_id, 
                         progress=current_percent, 
-                        message=f"Preparing chunk {chunk_num}/{total_chunks} ({current_percent}%)"
+                        message=f"Processing chunk {chunk_num}/{total_chunks} ({current_percent}%)"
                     )
 
-                    # Process the chunk
                     chunk_success, chunk_failed = await self._process_single_chunk(
                         df, 
                         job_id=job_id, 
@@ -147,7 +132,7 @@ class UploadService:
                     failed_count += chunk_failed
                     total_processed += len(df)
                     
-            # --- STEP 3: Completion ---
+            # STEP 3: Completion
             duration_ms = (datetime.now() - start_time).total_seconds() * 1000
             UPLOAD_JOBS.update(
                 job_id, 
@@ -160,7 +145,7 @@ class UploadService:
                     "time_ms": duration_ms
                 }
             )
-            logger.info(f"Job {job_id} finished. Total: {total_processed}, Success: {success_count}, Failed: {failed_count}")
+            logger.info(f"Job {job_id} finished.")
 
         except Exception as e:
             logger.error(f"Job {job_id} crashed: {e}")
@@ -177,12 +162,7 @@ class UploadService:
         chunk_num: int, 
         total_chunks: int
     ) -> tuple[int, int]:
-        """
-        Processes a single dataframe chunk with granular status updates.
-        Returns: (success_count, failed_count)
-        """
         try:
-            # Recalculate percent for sub-steps
             percent = int((chunk_num / total_chunks) * 100)
             percent = min(percent, 99)
 
@@ -201,35 +181,21 @@ class UploadService:
                     content = str(row.get("content", "")).strip()
                     agency = str(row.get("news_agency_name", "")).strip()
                     
-                    # Validation
-                    if not content:
-                        logger.warning(f"Job {job_id}, Chunk {chunk_num}, Row {idx}: Skipped - Missing content")
-                        failed_rows += 1
-                        continue
-                    
-                    if not title:
-                        logger.warning(f"Job {job_id}, Chunk {chunk_num}, Row {idx}: Skipped - Missing title")
+                    if not content or not title:
                         failed_rows += 1
                         continue
 
                     doc_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{url}-{title}"))
                     
-                    # Date parsing with explicit error handling
                     try:
                         raw_date = row.get("published_at")
                         if raw_date and str(raw_date).strip():
                             dt = pd.to_datetime(raw_date)
                         else:
                             dt = datetime.now()
-                            logger.debug(f"Job {job_id}, Chunk {chunk_num}, Row {idx}: Using current time (no date provided)")
-                        
                         ts = int(dt.timestamp())
                         iso_date = dt.isoformat()
-                    except Exception as date_error:
-                        logger.warning(
-                            f"Job {job_id}, Chunk {chunk_num}, Row {idx}: "
-                            f"Invalid date '{row.get('published_at')}' - {date_error}. Using current time."
-                        )
+                    except:
                         dt = datetime.now()
                         ts = int(dt.timestamp())
                         iso_date = dt.isoformat()
@@ -249,92 +215,43 @@ class UploadService:
                     milvus_data_buffer["ids"].append(doc_id)
                     milvus_data_buffer["timestamps"].append(ts)
                 
-                except Exception as row_error:
-                    logger.error(
-                        f"Job {job_id}, Chunk {chunk_num}, Row {idx}: "
-                        f"Failed to process - {type(row_error).__name__}: {row_error}"
-                    )
+                except Exception:
                     failed_rows += 1
                     continue
 
             if not es_docs:
-                logger.warning(f"Job {job_id}, Chunk {chunk_num}: No valid documents to process")
                 return 0, failed_rows
 
-            # 2. Embedding
-            UPLOAD_JOBS.update(
-                job_id, 
-                progress=percent, 
-                message=f"Embedding chunk {chunk_num}/{total_chunks} ({percent}%)"
-            )
+            # 2. Embedding (Run in executor to avoid blocking loop)
+            UPLOAD_JOBS.update(job_id, percent, f"Embedding chunk {chunk_num}/{total_chunks} ({percent}%)")
             
-            try:
-                loop = asyncio.get_running_loop()
-                vectors: List[List[float]] = await loop.run_in_executor(
-                    self._executor, 
-                    self.embedder.embed_documents, 
-                    texts_to_embed
-                )
-                
-                if len(vectors) != len(es_docs):
-                    logger.error(
-                        f"Job {job_id}, Chunk {chunk_num}: "
-                        f"Embedding count mismatch - Expected {len(es_docs)}, Got {len(vectors)}"
-                    )
-                    return 0, len(df)
-                
-                milvus_data_buffer["embeddings"] = vectors
-            except Exception as embed_error:
-                logger.error(
-                    f"Job {job_id}, Chunk {chunk_num}: "
-                    f"Embedding failed - {type(embed_error).__name__}: {embed_error}"
-                )
-                return 0, len(df)
+            loop = asyncio.get_running_loop()
+            vectors: List[List[float]] = await loop.run_in_executor(
+                self._executor, 
+                self.embedder.embed_documents, 
+                texts_to_embed
+            )
+            milvus_data_buffer["embeddings"] = vectors
 
             # 3. Indexing
-            UPLOAD_JOBS.update(
-                job_id, 
-                progress=percent, 
-                message=f"Indexing chunk {chunk_num}/{total_chunks} ({percent}%)"
-            )
+            UPLOAD_JOBS.update(job_id, percent, f"Indexing chunk {chunk_num}/{total_chunks} ({percent}%)")
 
-            try:
-                # Milvus insertion
-                await loop.run_in_executor(
-                    self._executor,
-                    self.milvus.insert_vectors,
-                    milvus_data_buffer["ids"], 
-                    milvus_data_buffer["embeddings"], 
-                    milvus_data_buffer["timestamps"]
-                )
-            except Exception as milvus_error:
-                logger.error(
-                    f"Job {job_id}, Chunk {chunk_num}: "
-                    f"Milvus insertion failed - {type(milvus_error).__name__}: {milvus_error}"
-                )
-                return 0, len(df)
-            
-            try:
-                # Elasticsearch indexing
-                await self.es.bulk_index(es_docs)
-            except Exception as es_error:
-                logger.error(
-                    f"Job {job_id}, Chunk {chunk_num}: "
-                    f"Elasticsearch indexing failed - {type(es_error).__name__}: {es_error}"
-                )
-                return 0, len(df)
-            
-            logger.info(
-                f"Job {job_id}, Chunk {chunk_num}: "
-                f"Successfully processed {len(es_docs)} documents, {failed_rows} failed"
+            # Milvus insertion (Now thread-safe and non-blocking via modified MilvusClient)
+            await loop.run_in_executor(
+                self._executor,
+                self.milvus.insert_vectors,
+                milvus_data_buffer["ids"], 
+                milvus_data_buffer["embeddings"], 
+                milvus_data_buffer["timestamps"]
             )
+            
+            # Elasticsearch indexing
+            await self.es.bulk_index(es_docs)
+            
             return len(es_docs), failed_rows
 
         except Exception as e:
-            logger.error(
-                f"Job {job_id}, Chunk {chunk_num}: "
-                f"Unexpected error - {type(e).__name__}: {e}"
-            )
+            logger.error(f"Chunk error: {e}")
             return 0, len(df)
 
 def get_upload_service(

@@ -48,8 +48,13 @@ class RAGService:
         async def run_dense():
             nonlocal query_vec
             try:
-                # Embed query here so we can reuse vector for cross-scoring later
-                query_vec = self.embedder.embed_query(request.query)
+                # CRITICAL FIX: Run embedding in a thread pool.
+                # If we run this synchronously, it blocks the Event Loop waiting for the 
+                # Embedding Lock (which might be held by the Upload Service).
+                loop = asyncio.get_running_loop()
+                query_vec = await loop.run_in_executor(None, self.embedder.embed_query, request.query)
+                
+                # Search Milvus (Milvus client is now thread-safe and non-blocking)
                 return self.milvus.search(query_embedding=query_vec, top_k=fetch_k)
             except Exception as e:
                 logger.error(f"Dense search failed: {e}")
@@ -69,50 +74,37 @@ class RAGService:
         # 2. Identify Candidates & Missing Scores
         all_ids = set([h['doc_id'] for h in dense_hits] + [h[0] for h in sparse_hits])
         
-        # Maps to store final complete scores
         final_dense_scores: Dict[str, float] = {h['doc_id']: h['score'] for h in dense_hits}
         final_sparse_scores: Dict[str, float] = {h[0]: h[1] for h in sparse_hits}
         
-        # Identify missing IDs
         missing_in_dense = [did for did in all_ids if did not in final_dense_scores]
         missing_in_sparse = [did for did in all_ids if did not in final_sparse_scores]
         
         # 3. Cross-Scoring (Hydration)
         
-        # Task A: Get missing vectors from Milvus & Calc Cosine
         async def fill_dense():
             if not missing_in_dense or not query_vec: return
             try:
-                # Fetch vectors
                 id_to_vec = self.milvus.get_vectors_by_doc_ids(missing_in_dense)
-                
-                # Manual Dot Product (Cosine Sim if normalized)
                 q_arr = np.array(query_vec)
                 for doc_id, emb in id_to_vec.items():
                     d_arr = np.array(emb)
-                    # Dot product
                     score = float(np.dot(q_arr, d_arr))
                     final_dense_scores[doc_id] = score
             except Exception as e:
                 logger.error(f"Dense filling failed: {e}")
 
-        # Task B: Get missing BM25 scores from ES
         async def fill_sparse():
             if not missing_in_sparse: return
             try:
-                # Ask ES to score these specific IDs against the query
                 new_scores = await self.es.get_bm25_scores(request.query, missing_in_sparse)
-                # Update map (if doc not found in ES at all, score remains 0 or ignored?)
-                # Actually, if not found in ES, score is effectively 0
                 for doc_id in missing_in_sparse:
                     final_sparse_scores[doc_id] = new_scores.get(doc_id, 0.0)
             except Exception as e:
                 logger.error(f"Sparse filling failed: {e}")
 
-        # Execute filling in parallel
         await asyncio.gather(fill_dense(), fill_sparse())
         
-        # Ensure everyone has a score (fill defaults if DB fetch failed)
         for doc_id in all_ids:
             if doc_id not in final_dense_scores: final_dense_scores[doc_id] = 0.0
             if doc_id not in final_sparse_scores: final_sparse_scores[doc_id] = 0.0
@@ -139,7 +131,6 @@ class RAGService:
         for rank, (doc_id, score) in enumerate(top_tuples, start=1):
             doc_content = docs_map.get(doc_id)
             if doc_content:
-                # Parse categories
                 cats = doc_content.get("categories")
                 if isinstance(cats, str):
                     try:
