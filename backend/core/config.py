@@ -21,7 +21,6 @@ class MilvusSettings(BaseSettings):
     m: int = Field(default=64)
     nbits: int = Field(default=8)
     
-    # Avoid building index on empty/small data
     index_build_threshold: int = Field(default=1024)
 
 
@@ -45,6 +44,16 @@ class EmbeddingSettings(BaseSettings):
     dimension: int = Field(default=1024)
     batch_size: int = Field(default=64)
     device: Literal["cuda", "cpu"] = Field(default="cpu")
+    
+    # --- Critical for Memory Calculation ---
+    context_length: int = Field(default=32768)
+    model_layers: int = Field(default=24, description="Number of layers (24 for 0.5B, 32 for 7B)")
+    
+    document_prefix: str = Field(default="passage: ")
+    query_prefix: str = Field(default="query: ")
+    
+    ram_safety_margin: float = Field(default=0.15)
+    worker_overhead_mb: int = Field(default=350)
 
 
 class UploadSettings(BaseSettings):
@@ -61,9 +70,8 @@ class LLMSettings(BaseSettings):
     base_url: str = Field(default="https://api.openai.com/v1")
     model: str = Field(default="gpt-5.1")
     temperature: float = Field(default=0.1)
-    max_completion_tokens: int = Field(default=2048)
-    
-    # Default to 400k (GPT-5.1 spec) if not set
+    # Updated default to 32k
+    max_completion_tokens: int = Field(default=32768)
     context_window: int = Field(default=400000)
 
 

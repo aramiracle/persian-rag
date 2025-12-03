@@ -5,7 +5,7 @@ import math
 import csv
 import pandas as pd
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor  # Keep ThreadPoolExecutor for upload
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
@@ -58,11 +58,15 @@ class UploadService:
         self.milvus = milvus_client
         self.es = es_service
         self.embedder = embedding_service
-        # Thread pool for CPU-bound tasks (Pandas, Embeddings, Milvus Insert)
+        
+        # Keep ThreadPoolExecutor for I/O-bound tasks (Milvus insert, ES bulk)
+        # The embedding service internally uses ProcessPoolExecutor for CPU-bound work
         self._executor = ThreadPoolExecutor(
             max_workers=2, 
             thread_name_prefix="upload_worker"
         )
+        
+        logger.info("Upload service initialized with 2 I/O workers")
 
     def _count_total_rows_exact(self, file_path: str) -> int:
         try:
@@ -226,13 +230,17 @@ class UploadService:
 
             logger.info(f"Job {job_id}: Chunk {chunk_num} parsed. {len(es_docs)} valid rows.")
 
-            # 2. Embedding (CPU Bound -> Executor)
+            # 2. Embedding (CPU Bound -> Uses Multi-Process Internally)
+            # NOTE: The embedding service now uses ProcessPoolExecutor internally
+            # This call will automatically distribute work across all CPU cores!
+            # No need to use executor here - embed_documents handles parallelization
             UPLOAD_JOBS.update(job_id, percent, f"Embedding chunk {chunk_num}/{total_chunks}...")
             
             loop = asyncio.get_running_loop()
             
+            # Call embedding service directly - it handles multi-processing internally
             vectors: List[List[float]] = await loop.run_in_executor(
-                self._executor, 
+                None,  # Use default thread executor (embedding service handles CPU parallelization)
                 self.embedder.embed_documents, 
                 texts_to_embed
             )
@@ -267,7 +275,10 @@ class UploadService:
             return 0, len(df)
 
     async def cleanup(self) -> None:
-        self._executor.shutdown(wait=False)
+        """Shutdown executor gracefully."""
+        logger.info("Shutting down upload service executor...")
+        self._executor.shutdown(wait=True, cancel_futures=False)
+        logger.info("Upload service executor stopped")
 
 def get_upload_service(
     milvus_client: MilvusClient, 
